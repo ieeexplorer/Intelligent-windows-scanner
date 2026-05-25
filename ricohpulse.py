@@ -29,6 +29,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 try:
+    import httpx
+    from bs4 import BeautifulSoup
+except Exception as exc:  # pragma: no cover
+    print("ERROR: httpx or beautifulsoup4 not installed. Fix: pip install -r requirements.txt")
+    print(f"Original error: {exc}")
+    import sys; sys.exit(1)
+
+try:
     from pysnmp.hlapi.v1arch.asyncio import (
         CommunityData,
         ObjectIdentity,
@@ -61,6 +69,37 @@ OID_HR_DEVICE_DESCR = "1.3.6.1.2.1.25.3.2.1.3"
 OID_HR_DEVICE_STATUS = "1.3.6.1.2.1.25.3.2.1.5"
 
 RICOH_ENTERPRISE_PREFIX = "1.3.6.1.4.1.367"
+
+# Ricoh private SNMP MIBs (enterprise OID branch 1.3.6.1.4.1.367)
+# These expose job-level scan results that standard Printer-MIB does not.
+OID_RICOH_SCAN_JOB_RESULT    = "1.3.6.1.4.1.367.3.2.1.1.1.9"  # last scan job result code
+OID_RICOH_SCAN_JOB_ERROR_MSG = "1.3.6.1.4.1.367.3.2.1.1.1.5"  # last scan error message
+OID_RICOH_SCAN_DEST_TYPE     = "1.3.6.1.4.1.367.3.2.1.2.19.2.1.4"  # scan destination type table
+OID_RICOH_SCAN_DEST_PATH     = "1.3.6.1.4.1.367.3.2.1.2.19.2.1.6"  # scan destination path table
+
+# Ricoh error code prefix -> plain-English note
+RICOH_SCAN_JOB_RESULT_CODES: Dict[str, str] = {
+    "0":  "Success",
+    "1":  "Unknown error",
+    "2":  "Authentication failure (wrong username/password for SMB share or SMTP account)",
+    "3":  "Destination not found (shared folder path missing or renamed)",
+    "4":  "Network error (device cannot reach destination server — check firewall/route)",
+    "5":  "File write error (share is read-only or disk is full)",
+    "6":  "SMTP error (mail server rejected connection or credentials)",
+    "7":  "DNS resolution failed (hostname cannot be resolved — use IP instead)",
+    "8":  "Login denied (account locked or wrong domain)",
+    "9":  "SSL/TLS error (certificate mismatch or TLS version unsupported)",
+    "10": "Timeout (server did not respond in time — check server load)",
+}
+
+# Web Image Monitor — known URL patterns for job/error logs across Ricoh generations
+_WIM_JOB_URLS = [
+    "/web/guest/en/websys/webArch/jobStatus.cgi",
+    "/web/guest/ja/websys/webArch/jobStatus.cgi",
+    "/web/entry.html?target=job",
+    "/web/support.html?target=job",
+    "/job/history.html",
+]
 
 HR_STATUS = {
     "1": "unknown",
@@ -367,6 +406,56 @@ def status_from_alerts(alerts: List[Alert]) -> str:
     return "ok"
 
 
+async def fetch_web_job_log(ip: str, timeout: float = 5.0) -> List[Dict[str, str]]:
+    """
+    Fetch job history from Ricoh Web Image Monitor (read-only HTTP GET).
+    Returns a list of failed job entries: {time, job_name, result, error_detail}.
+    Never sends POST; never changes device config.
+    """
+    failed_jobs: List[Dict[str, str]] = []
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        verify=False,          # Ricoh self-signed certs are common; read-only so safe here
+    ) as client:
+        for path in _WIM_JOB_URLS:
+            for scheme in ("http", "https"):
+                url = f"{scheme}://{ip}{path}"
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    # Ricoh job tables typically have class containing 'job' or 'history'
+                    tables = soup.find_all(
+                        "table",
+                        class_=lambda c: c and any(k in c.lower() for k in ("job", "history", "list")),
+                    ) or soup.find_all("table")
+                    for table in tables:
+                        for row in table.find_all("tr")[1:]:  # skip header row
+                            cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+                            if len(cells) < 3:
+                                continue
+                            result_text = cells[2] if len(cells) > 2 else ""
+                            if not any(
+                                kw in result_text.lower()
+                                for kw in ("fail", "error", "abort", "ng", "cancel")
+                            ):
+                                continue
+                            failed_jobs.append({
+                                "time":         cells[0] if len(cells) > 0 else "",
+                                "job_name":     cells[1] if len(cells) > 1 else "",
+                                "result":       result_text,
+                                "error_detail": cells[3] if len(cells) > 3 else result_text,
+                                "source_url":   url,
+                            })
+                    if failed_jobs:
+                        return failed_jobs   # got data — stop trying other URLs
+                except Exception:
+                    continue
+    return failed_jobs
+
+
 async def probe_is_ricoh(ip: str, snmp: SnmpClient) -> Optional[Tuple[str, str, str]]:
     sys_descr, sys_object_id = await asyncio.gather(
         snmp.get(ip, OID_SYS_DESCR),
@@ -397,7 +486,13 @@ async def discover_ricoh_devices(network: ipaddress.IPv4Network, snmp: SnmpClien
     return found
 
 
-async def check_device(ip: str, snmp: SnmpClient, db: RicohPulseDB, repeat_window: int) -> DeviceResult:
+async def check_device(
+    ip: str,
+    snmp: SnmpClient,
+    db: RicohPulseDB,
+    repeat_window: int,
+    web_scan: bool = False,
+) -> DeviceResult:
     sys_descr, sys_object_id, hostname, printer_name, serial = await asyncio.gather(
         snmp.get(ip, OID_SYS_DESCR),
         snmp.get(ip, OID_SYS_OBJECT_ID),
@@ -480,6 +575,45 @@ async def check_device(ip: str, snmp: SnmpClient, db: RicohPulseDB, repeat_windo
             )
             alert.repeated_count = db.repeated_count(ip, alert.key, repeat_window) + 1
             result.alerts.append(alert)
+
+    # ── Ricoh private SNMP: last scan job result ────────────────────────────
+    scan_result_code = await snmp.get(ip, OID_RICOH_SCAN_JOB_RESULT)
+    scan_error_msg   = await snmp.get(ip, OID_RICOH_SCAN_JOB_ERROR_MSG)
+    if scan_result_code and scan_result_code not in ("0", "", "noSuchObject", "noSuchInstance"):
+        code_text = RICOH_SCAN_JOB_RESULT_CODES.get(
+            scan_result_code,
+            f"Scan job error code {scan_result_code}",
+        )
+        detail = f"{code_text}" + (f" | Device message: {scan_error_msg}" if scan_error_msg else "")
+        alert = Alert(
+            source="Ricoh enterprise SNMP (last scan job)",
+            severity="warning",
+            code=scan_result_code,
+            description=f"Last scan job failed: {detail}",
+            fix=find_fix(detail),
+        )
+        alert.repeated_count = db.repeated_count(ip, alert.key, repeat_window) + 1
+        result.alerts.append(alert)
+
+    # ── Web Image Monitor: job log (opt-in) ─────────────────────────────────
+    if web_scan:
+        web_jobs = await fetch_web_job_log(ip)
+        for job in web_jobs:
+            desc = f"Scan job '{job['job_name']}' failed: {job['error_detail']}"
+            alert = Alert(
+                source=f"Web Image Monitor job log ({job['source_url']})",
+                severity="warning",
+                code="SCAN_JOB_FAIL",
+                description=desc,
+                fix=find_fix(desc),
+            )
+            alert.repeated_count = db.repeated_count(ip, alert.key, repeat_window) + 1
+            result.alerts.append(alert)
+        if web_jobs:
+            result.notes.append(
+                f"Web Image Monitor returned {len(web_jobs)} failed scan job(s). "
+                "Check destination credentials and paths on the device web UI."
+            )
 
     result.status = status_from_alerts(result.alerts)
     if not result.is_ricoh:
@@ -635,8 +769,9 @@ async def run_once(args) -> List[DeviceResult]:
             initial_devices = await discover_ricoh_devices(network, snmp, args.workers)
 
         results: List[DeviceResult] = []
+        web_scan = getattr(args, "web_scan", False)
         for ip, _sys_descr, _sys_object_id in initial_devices:
-            result = await check_device(ip, snmp, db, args.repeat_window)
+            result = await check_device(ip, snmp, db, args.repeat_window, web_scan=web_scan)
             db.save_result(result)
             results.append(result)
 
@@ -670,6 +805,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat-window", type=int, default=30, help="Repeated error window in minutes. Default: 30")
     parser.add_argument("--watch", action="store_true", help="Keep monitoring instead of running once.")
     parser.add_argument("--interval", type=int, default=300, help="Seconds between checks in watch mode. Default: 300")
+    parser.add_argument(
+        "--web-scan",
+        action="store_true",
+        dest="web_scan",
+        help="Also scrape Ricoh Web Image Monitor for failed scan jobs (read-only HTTP GET).",
+    )
     return parser
 
 

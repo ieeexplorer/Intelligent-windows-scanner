@@ -8,7 +8,65 @@ from types import SimpleNamespace
 import pandas as pd
 import streamlit as st
 
+import smtplib
+import socket
+import ssl
+import subprocess
+
 from ricohpulse import run_once, get_local_subnet
+
+
+# ── Connectivity test helpers ─────────────────────────────────────────────────
+
+def _smb_port_open(host: str) -> tuple[bool, str]:
+    try:
+        with socket.create_connection((host, 445), timeout=4):
+            return True, "Port 445 is reachable."
+    except OSError as exc:
+        return False, f"Port 445 unreachable: {exc}"
+
+
+def _smb_share(unc: str) -> str:
+    parts = unc.strip("\\").split("\\")
+    return f"\\\\{parts[0]}\\{parts[1]}" if len(parts) >= 2 else unc
+
+
+def _smb_auth_windows(unc: str, username: str, password: str) -> tuple[bool, str]:
+    share = _smb_share(unc)
+    try:
+        subprocess.run(["net", "use", share, "/delete", "/y"], capture_output=True, timeout=6)
+        r = subprocess.run(
+            ["net", "use", share, f"/user:{username}", password],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            subprocess.run(["net", "use", share, "/delete", "/y"], capture_output=True, timeout=6)
+            return True, "Authentication successful — share is accessible."
+        return False, (r.stderr or r.stdout).strip() or "Authentication failed (unknown error)."
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _smtp_test(server: str, port: int, username: str, password: str, use_ssl: bool) -> tuple[bool, str]:
+    ctx = ssl.create_default_context()
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(server, port, context=ctx, timeout=6) as s:
+                s.login(username, password)
+            return True, f"SSL connection to {server}:{port} and login OK."
+        else:
+            with smtplib.SMTP(server, port, timeout=6) as s:
+                s.ehlo()
+                s.starttls(context=ctx)
+                s.login(username, password)
+            return True, f"STARTTLS connection to {server}:{port} and login OK."
+    except smtplib.SMTPAuthenticationError:
+        return False, "Authentication failed — check username / password."
+    except smtplib.SMTPConnectError as exc:
+        return False, f"Could not connect: {exc}"
+    except Exception as exc:
+        return False, str(exc)
+
 
 st.set_page_config(page_title="RicohPulse Dashboard", page_icon="R", layout="wide")
 
@@ -158,7 +216,10 @@ st.markdown(
 st.markdown(
     """
 <div class='disclaimer'>
-<b>Safety:</b> This app does <b>not</b> change Ricoh settings or network config. It only reads SNMP data and writes local files on this PC.
+<b>Safety:</b> This app is <b>read-only</b> — it sends SNMP GET/WALK only and never changes Ricoh settings.<br>
+<b>SNMP limitation:</b> Device-level alerts (paper jams, toner, covers, offline) <b>are</b> visible here.
+Job-level failures — wrong SMB folder password, missing share, Microsoft&nbsp;365 SMTP auth errors — <b>may not appear in SNMP</b>.
+For those, use the <b>Test Scan Destinations</b> section below, or check the Ricoh web&nbsp;UI job&nbsp;log.
 </div>
 """,
     unsafe_allow_html=True,
@@ -219,6 +280,15 @@ with advanced:
     retries = st.slider("Retries", min_value=0, max_value=3, value=0)
     repeat_threshold = st.slider("Repeated alert threshold", min_value=2, max_value=10, value=3)
     repeat_window = st.slider("Repeat window (minutes)", min_value=5, max_value=240, value=30)
+    web_scan = st.checkbox(
+        "Scrape Web Image Monitor for failed scan jobs",
+        value=False,
+        help=(
+            "Attempts a read-only HTTP GET on each device\'s job-history page. "
+            "Catches scan-to-folder / scan-to-email failures that SNMP alone misses. "
+            "Adds a few seconds per device. Safe — no POST, no config changes."
+        ),
+    )
 
 run_scan = st.button("Run Scan", type="primary", use_container_width=True)
 
@@ -249,6 +319,7 @@ if run_scan:
             repeat_window=int(repeat_window),
             watch=False,
             interval=300,
+            web_scan=web_scan,
         )
         results = asyncio.run(run_once(args))
         st.session_state.results = results
@@ -312,7 +383,8 @@ if results:
         status_class = f"status-{d.status}" if d.status in ("ok", "warning", "error", "unknown") else "status-unknown"
         st.markdown("<div class='device-card'>", unsafe_allow_html=True)
         st.markdown(
-            f"<b>{d.ip}</b> &nbsp; <span class='status-chip {status_class}'>{d.status.upper()}</span>",
+            f"<b>{d.ip}</b> &nbsp; <span class='status-chip {status_class}'>{d.status.upper()}</span>"
+            f" &nbsp; <a href='http://{d.ip}/' target='_blank' style='font-size:0.82rem;color:#1a73e8;text-decoration:none;'>Open Ricoh web UI ↗</a>",
             unsafe_allow_html=True,
         )
         st.write(f"Hostname: {d.hostname or '-'}")
@@ -320,6 +392,18 @@ if results:
         st.write(f"Serial: {d.serial or '-'}")
 
         if d.alerts:
+            # Show a scan-job failure banner if any alert came from job logs
+            scan_job_alerts = [
+                a for a in d.alerts
+                if "job" in a.source.lower() or a.code == "SCAN_JOB_FAIL"
+                or "scan job" in a.description.lower()
+            ]
+            if scan_job_alerts:
+                st.warning(
+                    f"⚠️ {len(scan_job_alerts)} scan-job failure(s) detected — "
+                    "likely a credentials, path, or SMTP problem not visible in SNMP."
+                )
+
             st.markdown("**Alerts**")
             for a in d.alerts:
                 cls = "alert-crit" if a.severity == "critical" else "alert-warn"
@@ -364,7 +448,88 @@ if results:
             use_container_width=True,
         )
 
+# ── Scan destination tests ───────────────────────────────────────────────────
+st.divider()
+with st.expander("🔧 Test scan destinations (scan-to-folder & scan-to-email)", expanded=False):
+    st.caption(
+        "Use these tests when a Ricoh device shows no SNMP alert but users still cannot scan. "
+        "These tests check the actual destination — independent of the SNMP scan above."
+    )
+
+    st.markdown("##### Scan-to-Folder (SMB / Windows share)")
+    smb_col1, smb_col2 = st.columns([2, 1])
+    with smb_col1:
+        smb_unc = st.text_input(
+            "UNC path",
+            placeholder=r"\\server\ScanFolder  or  \\192.168.1.10\scans",
+            key="smb_unc",
+        )
+    with smb_col2:
+        smb_host_override = st.text_input("Server IP (for port test)", placeholder="auto", key="smb_host")
+
+    smb_user = st.text_input("Username", placeholder="DOMAIN\\user  or  user@domain.com", key="smb_user")
+    smb_pass = st.text_input("Password", type="password", key="smb_pass")
+
+    if st.button("Test SMB connection", key="btn_smb"):
+        if not smb_unc.strip():
+            st.error("Enter a UNC path first.")
+        else:
+            host = smb_host_override.strip() or smb_unc.strip("\\").split("\\")[0]
+            with st.spinner(f"Testing port 445 on {host}..."):
+                ok, msg = _smb_port_open(host)
+            if ok:
+                st.success(f"Port check: {msg}")
+                if smb_user.strip():
+                    with st.spinner("Testing SMB authentication..."):
+                        ok2, msg2 = _smb_auth_windows(smb_unc.strip(), smb_user.strip(), smb_pass)
+                    if ok2:
+                        st.success(f"Auth check: {msg2}")
+                    else:
+                        st.error(f"Auth check failed: {msg2}")
+                        st.info(
+                            "Fix: Check the UNC path, username (try DOMAIN\\\\user or user@domain.com), "
+                            "password, share permissions, and NTFS permissions on the destination folder."
+                        )
+                else:
+                    st.info("Enter a username + password above to also test SMB authentication.")
+            else:
+                st.error(f"Port check failed: {msg}")
+                st.info("Fix: Ensure the file server is reachable and Windows file sharing (port 445) is not blocked by a firewall.")
+
+    st.markdown("---")
+    st.markdown("##### Scan-to-Email (SMTP)")
+    mail_col1, mail_col2, mail_col3 = st.columns([2, 1, 1])
+    with mail_col1:
+        smtp_server = st.text_input("SMTP server", placeholder="smtp.office365.com", key="smtp_srv")
+    with mail_col2:
+        smtp_port = st.number_input("Port", min_value=1, max_value=65535, value=587, key="smtp_port")
+    with mail_col3:
+        smtp_ssl = st.checkbox("Use SSL (port 465)", value=False, key="smtp_ssl")
+
+    smtp_user = st.text_input("SMTP username / email", key="smtp_user")
+    smtp_pass = st.text_input("SMTP password", type="password", key="smtp_pass")
+
+    if st.button("Test SMTP connection", key="btn_smtp"):
+        if not smtp_server.strip():
+            st.error("Enter an SMTP server first.")
+        else:
+            with st.spinner(f"Connecting to {smtp_server}:{smtp_port}..."):
+                ok, msg = _smtp_test(
+                    smtp_server.strip(), int(smtp_port),
+                    smtp_user.strip(), smtp_pass, smtp_ssl,
+                )
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+                st.info(
+                    "Fix: Check SMTP server address, port (587=STARTTLS, 465=SSL), "
+                    "username/password, and whether the account requires an app password "
+                    "(Microsoft 365 / Gmail with MFA enabled)."
+                )
+
 st.markdown(
-    "<p class='footer-note'>SNMP may not expose every scan-to-folder/email job-level failure. For those, check Ricoh web UI job logs and destination server/email logs.</p>",
+    "<p class='footer-note'>Device-level SNMP alerts are shown in the scan above. "
+    "Job-level failures (wrong SMB credentials, SMTP auth) may not appear in SNMP — use the test section above.</p>",
     unsafe_allow_html=True,
 )
