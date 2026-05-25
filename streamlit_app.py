@@ -164,16 +164,55 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-left, right = st.columns([1, 1])
-with left:
-    subnet = st.text_input("Subnet", value=get_local_subnet(), help="Example: 192.168.1.0/24")
-    manual_ips = st.text_input("Optional fixed IPs", placeholder="192.168.1.45 192.168.1.46")
-    community = st.text_input("SNMP community", value="public")
+# ── Scan mode ─────────────────────────────────────────────────────────────
+use_ips_mode = st.radio(
+    "Scan mode",
+    ["📍 Enter scanner IPs (recommended)", "🔍 Auto-scan subnet"],
+    index=0,
+    horizontal=True,
+    label_visibility="collapsed",
+)
+use_ips = use_ips_mode.startswith("📍")
 
-with right:
-    snmp_version = st.selectbox("SNMP version", options=["2c", "1"], index=0)
-    workers = st.slider("Concurrency workers", min_value=10, max_value=200, value=80, step=10)
+if use_ips:
+    st.markdown("#### Enter your Ricoh scanner IP addresses")
+    st.caption(
+        "Paste the IPs of your C5500 / C300 scanners — one per line or space-separated. "
+        "The scanner will go straight to these addresses without needing to sweep the whole subnet."
+    )
+    ip_textarea = st.text_area(
+        "Scanner IP addresses",
+        placeholder="192.168.1.45\n192.168.1.46\n192.168.1.50",
+        height=130,
+        label_visibility="collapsed",
+    )
+    col_a, col_b = st.columns(2)
+    with col_a:
+        community = st.text_input("SNMP community", value="public")
+    with col_b:
+        snmp_version = st.selectbox("SNMP version", options=["2c", "1"], index=0)
+    subnet = None
+    workers = 80
+    timeout = 0.8
+else:
+    st.markdown("#### Auto-scan subnet")
+    subnet = st.text_input("Subnet", value=get_local_subnet(), help="Example: 192.168.1.0/24")
+    col_c, col_d, col_e = st.columns(3)
+    with col_c:
+        community = st.text_input("SNMP community", value="public")
+    with col_d:
+        snmp_version = st.selectbox("SNMP version", options=["2c", "1"], index=0)
+    with col_e:
+        workers = st.slider("Workers", min_value=10, max_value=200, value=80, step=10)
     timeout = st.slider("SNMP timeout (seconds)", min_value=0.2, max_value=2.0, value=0.8, step=0.1)
+    ip_textarea = ""
+
+# ── Model filter ───────────────────────────────────────────────────────────
+filter_model = st.checkbox(
+    "Only show Ricoh C5500 / C300 results",
+    value=True,
+    help="Hides any other Ricoh models that respond. Uncheck to see all Ricoh devices.",
+)
 
 advanced = st.expander("Advanced options")
 with advanced:
@@ -184,10 +223,19 @@ with advanced:
 run_scan = st.button("Run Scan", type="primary", use_container_width=True)
 
 if run_scan:
-    with st.spinner("Scanning subnet and checking Ricoh devices..."):
+    parsed_ips = (
+        [x.strip() for x in ip_textarea.replace("\n", " ").split() if x.strip()]
+        if use_ips else None
+    )
+    if use_ips and not parsed_ips:
+        st.error("Please enter at least one scanner IP address above.")
+        st.stop()
+
+    spinner_msg = "Checking Ricoh devices..." if use_ips else "Scanning subnet and checking Ricoh devices..."
+    with st.spinner(spinner_msg):
         args = SimpleNamespace(
-            subnet=subnet.strip() or None,
-            ips=[x.strip() for x in manual_ips.split() if x.strip()] if manual_ips.strip() else None,
+            subnet=subnet,
+            ips=parsed_ips,
             community=community.strip() or "public",
             snmp_version=snmp_version,
             timeout=float(timeout),
@@ -208,8 +256,23 @@ if run_scan:
         st.session_state.csv_path = str(Path(args.csv).resolve())
         st.session_state.html_path = str(Path(args.html).resolve())
         st.session_state.db_path = str(Path(args.db).resolve())
+        st.session_state.filter_model = filter_model
 
 results = st.session_state.results
+
+# Apply C5500 / C300 model filter if it was active during the last scan
+_filter_model = st.session_state.get("filter_model", True)
+_MODEL_KW = ("c5500", "c300", "c 5500", "c 300", "im c5500", "im c300")
+if _filter_model and results:
+    results = [
+        r for r in results
+        if any(kw in (r.model + " " + r.sys_descr).lower() for kw in _MODEL_KW)
+    ]
+    if not results:
+        st.warning(
+            "No C5500 or C300 devices were found in the last scan results. "
+            "Uncheck **Only show Ricoh C5500 / C300 results** and re-run to see all Ricoh devices."
+        )
 
 if results:
     total = len(results)

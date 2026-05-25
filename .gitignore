@@ -1,0 +1,9 @@
+# Python cache and virtual env
+__pycache__/
+*.py[cod]
+.venv/
+
+# RicohPulse local outputs
+ricohpulse.db
+ricohpulse_report.csv
+ricohpulse_report.html
